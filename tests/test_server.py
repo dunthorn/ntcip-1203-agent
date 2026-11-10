@@ -16,7 +16,6 @@ from ntcip_agent.sign_state import (
 )
 from ntcip_agent.snmp_message import (
     ERR_BAD_VALUE,
-    ERR_GEN_ERR,
     ERR_NO_ERROR,
     ERR_NO_SUCH_NAME,
     ERR_READ_ONLY,
@@ -65,20 +64,19 @@ class TestGetRequest(unittest.TestCase):
         self.assertEqual(pdu.error_index, 1)
         self.assertEqual(pdu.variable_bindings[0].value.tag, ber.TAG_NULL)
 
-    def test_wrong_read_community_returns_gen_err(self):
+    def test_wrong_read_community_is_dropped(self):
         agent = new_agent()
-        reply = agent.handle_message(
-            request(
-                ber.TAG_GET_REQUEST,
-                3,
-                [VarBind(SYS_DESCR, Value.null())],
-                community=b"wrong",
+        with self.assertLogs("ntcip_agent.server", level="WARNING") as logs:
+            reply = agent.handle_message(
+                request(
+                    ber.TAG_GET_REQUEST,
+                    3,
+                    [VarBind(SYS_DESCR, Value.null())],
+                    community=b"wrong",
+                )
             )
-        )
-        pdu = decode(reply)
-        self.assertEqual(pdu.error_status, ERR_GEN_ERR)
-        # community-error bindings echo the original request bindings
-        self.assertEqual(pdu.variable_bindings[0].value.tag, ber.TAG_NULL)
+        self.assertIsNone(reply)
+        self.assertIn("community mismatch", logs.output[0])
 
 
 class TestGetNextRequest(unittest.TestCase):
@@ -117,19 +115,21 @@ class TestSetRequest(unittest.TestCase):
         self.assertEqual(pdu.error_status, ERR_READ_ONLY)
         self.assertEqual(pdu.error_index, 1)
 
-    def test_wrong_write_community_returns_gen_err(self):
+    def test_wrong_write_community_is_dropped_without_side_effects(self):
         agent = new_agent()
         oid = MESSAGE_TABLE + (3, MEM_CHANGEABLE, 1)
-        reply = agent.handle_message(
-            request(
-                ber.TAG_SET_REQUEST,
-                7,
-                [VarBind(oid, Value.octet_string(b"HI"))],
-                community=b"wrong",
+        before = agent.state.messages[(MEM_CHANGEABLE, 1)].multistring
+        with self.assertLogs("ntcip_agent.server", level="WARNING"):
+            reply = agent.handle_message(
+                request(
+                    ber.TAG_SET_REQUEST,
+                    7,
+                    [VarBind(oid, Value.octet_string(b"HI"))],
+                    community=b"wrong",
+                )
             )
-        )
-        pdu = decode(reply)
-        self.assertEqual(pdu.error_status, ERR_GEN_ERR)
+        self.assertIsNone(reply)
+        self.assertEqual(agent.state.messages[(MEM_CHANGEABLE, 1)].multistring, before)
 
     def test_set_invalid_value_returns_bad_value(self):
         agent = new_agent()

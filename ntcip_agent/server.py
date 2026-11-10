@@ -26,7 +26,6 @@ from .mib_tree import MibRegistry, build_registry
 from .sign_state import SignState
 from .snmp_message import (
     ERR_BAD_VALUE,
-    ERR_GEN_ERR,
     ERR_NO_ERROR,
     ERR_NO_SUCH_NAME,
     ERR_READ_ONLY,
@@ -47,7 +46,9 @@ class DmsAgent:
         self.state = SignState(sign)
         self.registry: MibRegistry = build_registry(self.state)
 
-    def handle_message(self, data: bytes) -> Optional[bytes]:
+    def handle_message(
+        self, data: bytes, peer: Optional[Tuple[str, int]] = None
+    ) -> Optional[bytes]:
         try:
             message = SNMPMessage.decode(data)
         except (BerError, ValueError, IndexError) as exc:
@@ -56,32 +57,37 @@ class DmsAgent:
 
         pdu = message.pdu
 
-        if pdu.pdu_type == ber.TAG_GET_REQUEST:
-            response = self._handle_get(pdu, next_request=False)
-            community_ok = (
-                message.community == self.network.read_community.encode()
-            )
-        elif pdu.pdu_type == ber.TAG_GET_NEXT_REQUEST:
-            response = self._handle_get(pdu, next_request=True)
-            community_ok = (
-                message.community == self.network.read_community.encode()
-            )
+        if pdu.pdu_type in (ber.TAG_GET_REQUEST, ber.TAG_GET_NEXT_REQUEST):
+            expected = self.network.read_community.encode()
+            kind = "read"
         elif pdu.pdu_type == ber.TAG_SET_REQUEST:
-            response = self._handle_set(pdu)
-            community_ok = (
-                message.community == self.network.write_community.encode()
-            )
+            expected = self.network.write_community.encode()
+            kind = "write"
         else:
             logger.debug("ignoring unsupported PDU type 0x%02x", pdu.pdu_type)
             return None
 
-        if not community_ok:
-            response = PDU(
-                pdu_type=ber.TAG_GET_RESPONSE,
-                request_id=pdu.request_id,
-                error_status=ERR_GEN_ERR,
-                error_index=0,
-                variable_bindings=pdu.variable_bindings,
+        # Like a real SNMPv1 agent, silently drop requests with a bad
+        # community (no response). Checked before processing so that a
+        # SetRequest with the wrong community never modifies sign state.
+        if message.community != expected:
+            logger.warning(
+                "sign %s: dropping request id %d from %s: %s community "
+                "mismatch (received %r, expected %r)",
+                self.sign.name,
+                pdu.request_id,
+                "%s:%d" % peer if peer else "unknown peer",
+                kind,
+                message.community.decode("latin-1"),
+                expected.decode("latin-1"),
+            )
+            return None
+
+        if pdu.pdu_type == ber.TAG_SET_REQUEST:
+            response = self._handle_set(pdu)
+        else:
+            response = self._handle_get(
+                pdu, next_request=pdu.pdu_type == ber.TAG_GET_NEXT_REQUEST
             )
 
         reply = SNMPMessage(message.version, message.community, response)
@@ -173,7 +179,7 @@ class _UdpHandler(socketserver.BaseRequestHandler):
     def handle(self) -> None:
         data, sock = self.request
         agent: DmsAgent = self.server.agent  # type: ignore[attr-defined]
-        reply = agent.handle_message(data)
+        reply = agent.handle_message(data, self.client_address)
         if reply is not None:
             sock.sendto(reply, self.client_address)
 
@@ -197,7 +203,7 @@ class _TcpHandler(socketserver.BaseRequestHandler):
             if payload is None:
                 return
             data = prefix + length_bytes + payload
-            reply = agent.handle_message(data)
+            reply = agent.handle_message(data, self.client_address)
             if reply is not None:
                 self.request.sendall(reply)
 
